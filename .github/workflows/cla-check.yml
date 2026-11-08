@@ -1,0 +1,178 @@
+# Shared CLA check for every paularlott project.
+#
+# A project calls it from .github/workflows/cla-check.yml:
+#
+#   name: CLA
+#   on:
+#     pull_request_target:
+#       types: [opened, reopened, synchronize]
+#   permissions:
+#     pull-requests: write
+#     issues: write
+#   jobs:
+#     cla-check:
+#       uses: paularlott/cla/.github/workflows/cla-check.yml@main
+#
+# pull_request_target gives pull requests from forks a token that can label
+# and comment. That is safe here because this workflow never checks out or
+# runs anything from the pull request: it only reads the author's login and
+# the signer list.
+#
+# The signer list is .clabot.json in this repository (paularlott/cla), read through the
+# GitHub API so a newly added name is seen at once (raw.githubusercontent.com
+# caches for minutes). Both shapes are accepted:
+#   {"contributors": ["login", ...]}
+#   {"individuals": ["login", ...], "companies": {"Company": ["login", ...]}}
+
+name: CLA check
+
+on:
+  workflow_call:
+    inputs:
+      signers-repo:
+        description: Repository (owner/name) holding the signer list
+        type: string
+        default: paularlott/cla
+      signers-path:
+        description: Path of the signer list in that repository
+        type: string
+        default: .clabot.json
+      signers-ref:
+        description: Branch, tag or commit to read the signer list from
+        type: string
+        default: main
+      agreement-url:
+        description: Where the agreement can be read
+        type: string
+        default: https://github.com/paularlott/cla/blob/main/CONTRIBUTOR_LICENSE_AGREEMENT.md
+      form-url:
+        description: Where the agreement is signed
+        type: string
+        default: https://forms.gle/47ZfWHQaqCF35MTU6
+
+jobs:
+  cla:
+    name: Check CLA status
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check the pull request author has signed the CLA
+        uses: actions/github-script@v7
+        env:
+          SIGNERS_REPO: ${{ inputs.signers-repo }}
+          SIGNERS_PATH: ${{ inputs.signers-path }}
+          SIGNERS_REF: ${{ inputs.signers-ref }}
+          AGREEMENT_URL: ${{ inputs.agreement-url }}
+          FORM_URL: ${{ inputs.form-url }}
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('The CLA check must be triggered by pull_request_target (or pull_request).');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const issue_number = pr.number;
+            const username = pr.user.login;
+
+            const OK_LABEL = 'cla: ok';
+            const MISSING_LABEL = 'cla: required';
+            const MARKER = '<!-- CLA-MISSING-MARKER -->';
+
+            // Bots (Dependabot, Renovate, GitHub Actions) cannot sign.
+            if (pr.user.type === 'Bot') {
+              core.info(`${username} is a bot; no CLA needed.`);
+              return;
+            }
+
+            // 1. Load the signer list. Fail closed: a list that cannot be
+            // read or parsed never passes the check.
+            const [signersOwner, signersRepo] = process.env.SIGNERS_REPO.split('/');
+            let config;
+            try {
+              const res = await github.request('GET /repos/{owner}/{repo}/contents/{path}', {
+                owner: signersOwner,
+                repo: signersRepo,
+                path: process.env.SIGNERS_PATH,
+                ref: process.env.SIGNERS_REF,
+                headers: { accept: 'application/vnd.github.raw+json' },
+              });
+              // The raw media type comes back as text; decode bytes too.
+              let data = res.data;
+              if (data instanceof ArrayBuffer) data = Buffer.from(data).toString('utf8');
+              config = typeof data === 'string' ? JSON.parse(data) : data;
+            } catch (e) {
+              core.setFailed(`Could not read the CLA signer list ${process.env.SIGNERS_REPO}/${process.env.SIGNERS_PATH}@${process.env.SIGNERS_REF}: ${e.message}`);
+              return;
+            }
+            const individuals = config.individuals || config.contributors || [];
+            const companies = config.companies || {};
+            if (!Array.isArray(individuals) || typeof companies !== 'object') {
+              core.setFailed('The CLA signer list has an unexpected shape.');
+              return;
+            }
+            const signers = new Set(
+              [...individuals, ...Object.values(companies).flat()]
+                .filter(u => typeof u === 'string')
+                .map(u => u.toLowerCase())
+            );
+            const hasSigned = signers.has(username.toLowerCase());
+
+            // 2. Make sure both labels exist on this repository.
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+                await github.rest.issues.createLabel({ owner, repo, name, color, description });
+              }
+            }
+            await ensureLabel(OK_LABEL, '0e8a16', 'Contributor has signed the CLA');
+            await ensureLabel(MISSING_LABEL, 'e11d21', 'Contributor must sign the CLA');
+
+            // 3. Swap the labels on the pull request.
+            const want = hasSigned ? OK_LABEL : MISSING_LABEL;
+            const drop = hasSigned ? MISSING_LABEL : OK_LABEL;
+            const { data: current } = await github.rest.issues.listLabelsOnIssue({ owner, repo, issue_number });
+            const names = current.map(l => l.name);
+            if (!names.includes(want)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [want] });
+            }
+            if (names.includes(drop)) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: drop });
+            }
+
+            // 4. Post, refresh or remove the instructions comment.
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.includes(MARKER));
+
+            if (hasSigned) {
+              if (existing) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+              }
+              core.info(`${username} has signed the CLA.`);
+              return;
+            }
+
+            const body = [
+              MARKER,
+              `Thanks for your contribution, @${username}!`,
+              '',
+              'Before we can review this pull request, you need to accept the Contributor License Agreement (CLA). It covers every project under github.com/paularlott, so you only sign once.',
+              '',
+              `1. Read the agreement: ${process.env.AGREEMENT_URL}`,
+              `2. Sign it here: ${process.env.FORM_URL}`,
+              '',
+              'Once a maintainer has added your GitHub username to the list of signers, this check passes the next time it runs: when you push to this pull request, or when a maintainer re-runs it.',
+            ].join('\n');
+
+            if (existing) {
+              if (existing.body !== body) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              }
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+            core.setFailed(`${username} has not signed the CLA.`);
